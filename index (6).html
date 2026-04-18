@@ -1,0 +1,217 @@
+<!DOCTYPE html>
+<html lang="sv">
+<head>
+<meta charset="UTF-8">
+<title>PropertyScout Analyzer</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/sql.js@1.10.3/dist/sql-wasm.js"></script>
+<style>
+body{margin:20px;font-family:Arial;background:#667eea}
+.box{background:#fff;padding:30px;border-radius:15px;margin:20px auto;max-width:1400px;box-shadow:0 10px 40px rgba(0,0,0,0.3)}
+h1{color:#fff;text-align:center;font-size:42px}
+.upload{border:3px dashed #667eea;padding:60px;text-align:center;border-radius:10px;cursor:pointer;background:#f8f9fa;margin-bottom:20px}
+.upload:hover{background:#e9ecef;border-color:#764ba2}
+button{padding:15px 40px;background:#667eea;color:#fff;border:none;border-radius:8px;font-size:16px;cursor:pointer;font-weight:600}
+button:hover{background:#764ba2}
+input{display:none}
+#map{height:600px;border-radius:10px;margin:20px 0}
+.log{background:#1e1e1e;color:#0f0;padding:15px;border-radius:8px;font-family:monospace;font-size:12px;max-height:200px;overflow-y:auto;margin-top:20px}
+.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:15px;margin:20px 0}
+.stat{background:linear-gradient(135deg,#667eea,#764ba2);color:#fff;padding:25px;border-radius:10px;text-align:center}
+.stat .num{font-size:36px;font-weight:bold}
+.stat .label{opacity:0.9;font-size:14px;margin-top:5px}
+.list{max-height:600px;overflow-y:auto;background:#f8f9fa;padding:20px;border-radius:10px}
+.item{background:#fff;border:2px solid #e0e0e0;padding:15px;margin:10px 0;border-radius:8px;cursor:pointer}
+.item:hover{border-color:#667eea;transform:translateX(5px)}
+.item.hot{border-color:#28a745;border-width:3px;background:linear-gradient(to right,#f0fff4,#fff)}
+.name{font-weight:bold;font-size:16px;margin-bottom:8px}
+.details{font-size:14px;color:#666}
+.badge{background:#28a745;color:#fff;padding:4px 12px;border-radius:20px;font-size:12px;margin-left:10px}
+.two-col{display:grid;grid-template-columns:1fr 1fr;gap:20px}
+.success{color:#0f0}
+.error{color:#f00}
+.info{color:#0ff}
+</style>
+</head>
+<body>
+
+<h1>🏡 PropertyScout Analyzer</h1>
+
+<div class="box">
+  <div class="upload" onclick="document.getElementById('file').click()">
+    <h2>📁 Ladda GeoPackage (.gpkg)</h2>
+    <p>Dra och släpp din .gpkg-fil här, eller klicka</p>
+    <button type="button">Välj fil</button>
+    <input type="file" id="file" accept=".gpkg" onchange="loadFile(this.files[0])">
+  </div>
+  
+  <div class="stats" id="stats" style="display:none"></div>
+  
+  <div class="two-col" id="main" style="display:none">
+    <div id="map"></div>
+    <div class="list" id="list"></div>
+  </div>
+  
+  <div class="log" id="log">&gt; Väntar på fil...</div>
+</div>
+
+<script>
+var SQL,map,layer,props=[];
+
+window.onload=function(){
+  log('Laddar SQL.js...','info');
+  initSqlJs({locateFile:f=>`https://cdn.jsdelivr.net/npm/sql.js@1.10.3/dist/${f}`})
+    .then(s=>{SQL=s;log('SQL.js redo','success')})
+    .catch(e=>log('SQL.js fel: '+e.message,'error'));
+  
+  var drop=document.querySelector('.upload');
+  drop.ondragover=e=>{e.preventDefault();drop.style.borderColor='#28a745'};
+  drop.ondragleave=()=>drop.style.borderColor='#667eea';
+  drop.ondrop=e=>{e.preventDefault();drop.style.borderColor='#667eea';if(e.dataTransfer.files[0])loadFile(e.dataTransfer.files[0])};
+};
+
+function log(m,t){
+  var d=document.getElementById('log');
+  d.innerHTML+=`<div class="${t}">&gt; ${m}</div>`;
+  d.scrollTop=d.scrollHeight;
+  console.log(m);
+}
+
+async function loadFile(f){
+  if(!f||!f.name.endsWith('.gpkg'))return alert('Välj .gpkg-fil!');
+  if(!SQL)return alert('SQL.js inte redo än, vänta 2 sek');
+  
+  log('Läser '+f.name,'info');
+  try{
+    var buf=await f.arrayBuffer();
+    var db=new SQL.Database(new Uint8Array(buf));
+    log('Parsar...','info');
+    
+
+    
+    var res=db.exec('SELECT * FROM "'+tab+'" LIMIT 10000');
+    if(!res[0])throw new Error('Tom tabell');
+    
+    var cols=res[0].columns;
+    var rows=res[0].values;
+    var gIdx=cols.findIndex(c=>c.toLowerCase().includes('geom'));
+    var nIdx=cols.findIndex(c=>c.toLowerCase().includes('beteckning')||c.toLowerCase()==='namn');
+    
+    log('Parsar '+rows.length+' rader','info');
+    
+    props=[];
+    rows.forEach((r,i)=>{
+      try{
+        var coords=parseWKB(r[gIdx]);
+        if(coords&&coords.length>2){
+          var area=calcArea(coords);
+          props.push({name:nIdx>=0?r[nIdx]:'#'+(i+1),area:area,coords:coords});
+        }
+      }catch(e){}
+    });
+    
+    log('Hittade '+props.length+' fastigheter','success');
+    
+    if(props.length>0){
+      initMap();
+      render();
+    }
+    
+  }catch(e){
+    log('FEL: '+e.message,'error');
+    console.error(e);
+  }
+}
+
+function parseWKB(blob){
+  if(!blob||blob.length<50)return null;
+  try{
+    var v=new DataView(blob.buffer||blob);
+    var coords=[],off=8;
+    for(var i=0;i<Math.min(Math.floor((blob.length-off)/16),10000);i++){
+      try{
+        var x=v.getFloat64(off,true),y=v.getFloat64(off+8,true);
+        if(x>100000&&y>6000000){
+          var lat=(y-6100000)/111320+55,lon=(x-500000)/111320+9;
+          if(lat>=55&&lat<=70&&lon>=10&&lon<=25)coords.push([lat,lon]);
+        }else if(x>=10&&x<=25&&y>=55&&y<=70){
+          coords.push([y,x]);
+        }
+        off+=16;
+      }catch(e){break}
+    }
+    return coords.length>2?coords:null;
+  }catch(e){return null}
+}
+
+function calcArea(c){
+  var a=0,j=c.length-1;
+  for(var i=0;i<c.length;i++){
+    a+=(c[j][1]+c[i][1])*(c[j][0]-c[i][0]);
+    j=i;
+  }
+  return Math.abs(a*111320*111320/2);
+}
+
+function initMap(){
+  if(!map){
+    map=L.map('map').setView([59.33,18.07],10);
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png').addTo(map);
+    layer=L.layerGroup().addTo(map);
+  }
+  document.getElementById('main').style.display='grid';
+  document.getElementById('stats').style.display='grid';
+}
+
+function render(){
+  props.sort((a,b)=>b.area-a.area);
+  
+  var min=800;
+  var tot=props.length;
+  var hot=props.filter(p=>p.area>=min*2).length;
+  var ok=props.filter(p=>p.area>=min).length;
+  var avg=Math.round(props.reduce((s,p)=>s+p.area,0)/tot);
+  
+  document.getElementById('stats').innerHTML=
+    `<div class="stat"><div class="num">${tot}</div><div class="label">Totalt</div></div>`+
+    `<div class="stat"><div class="num">${ok}</div><div class="label">Intressanta</div></div>`+
+    `<div class="stat"><div class="num">${hot}</div><div class="label">Hög potential</div></div>`+
+    `<div class="stat"><div class="num">${avg.toLocaleString('sv')}</div><div class="label">Medel (m²)</div></div>`;
+  
+  layer.clearLayers();
+  var bounds=[];
+  
+  props.forEach((p,i)=>{
+    var isHot=p.area>=min*2;
+    var isOk=p.area>=min;
+    var col=isHot?'#28a745':isOk?'#ffc107':'#667eea';
+    
+    L.polygon(p.coords,{color:col,weight:isOk?2:1,fillColor:col,fillOpacity:isOk?0.3:0.15})
+      .addTo(layer)
+      .bindPopup('<b>'+p.name+'</b><br>'+Math.round(p.area).toLocaleString('sv')+' m²');
+    
+    p.coords.forEach(c=>bounds.push(c));
+  });
+  
+  if(bounds.length>0)map.fitBounds(bounds,{padding:[30,30]});
+  
+  var html='<h3>Fastigheter ('+tot+')</h3>';
+  props.forEach((p,i)=>{
+    var isHot=p.area>=min*2;
+    var isOk=p.area>=min;
+    html+=`<div class="item ${isHot?'hot':''}" onclick="map.fitBounds(props[${i}].coords,{padding:[50,50]})">`;
+    html+=`<div class="name">${p.name}`;
+    if(isHot)html+=`<span class="badge">🎯 HÖG POTENTIAL</span>`;
+    html+=`</div><div class="details">📐 ${Math.round(p.area).toLocaleString('sv')} m²`;
+    if(isOk)html+=` | ✂️ ~${Math.floor(p.area/min)} tomter`;
+    html+=`</div></div>`;
+  });
+  document.getElementById('list').innerHTML=html;
+  
+  log('Klar! Visade '+tot+' fastigheter','success');
+}
+</script>
+
+</body>
+</html>
