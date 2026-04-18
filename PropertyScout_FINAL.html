@@ -1,0 +1,381 @@
+<!DOCTYPE html>
+<html lang="sv">
+<head>
+<meta charset="UTF-8">
+<title>PropertyScout Analyzer</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/sql.js@1.10.3/dist/sql-wasm.js"></script>
+<style>
+body{margin:20px;font-family:Arial;background:#667eea}
+.box{background:#fff;padding:30px;border-radius:15px;margin:20px auto;max-width:1400px;box-shadow:0 10px 40px rgba(0,0,0,0.3)}
+h1{color:#fff;text-align:center;font-size:42px}
+.upload{border:3px dashed #667eea;padding:60px;text-align:center;border-radius:10px;cursor:pointer;background:#f8f9fa;margin-bottom:20px}
+.upload:hover{background:#e9ecef;border-color:#764ba2}
+button{padding:15px 40px;background:#667eea;color:#fff;border:none;border-radius:8px;font-size:16px;cursor:pointer;font-weight:600}
+button:hover{background:#764ba2}
+input{display:none}
+#map{height:600px;border-radius:10px;margin:20px 0}
+.log{background:#1e1e1e;color:#0f0;padding:15px;border-radius:8px;font-family:monospace;font-size:12px;max-height:200px;overflow-y:auto;margin-top:20px}
+.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:15px;margin:20px 0}
+.stat{background:linear-gradient(135deg,#667eea,#764ba2);color:#fff;padding:25px;border-radius:10px;text-align:center}
+.stat .num{font-size:36px;font-weight:bold}
+.stat .label{opacity:0.9;font-size:14px;margin-top:5px}
+.list{max-height:600px;overflow-y:auto;background:#f8f9fa;padding:20px;border-radius:10px}
+.item{background:#fff;border:2px solid #e0e0e0;padding:15px;margin:10px 0;border-radius:8px;cursor:pointer}
+.item:hover{border-color:#667eea;transform:translateX(5px);transition:0.2s}
+.item.hot{border-color:#28a745;border-width:3px;background:linear-gradient(to right,#f0fff4,#fff)}
+.name{font-weight:bold;font-size:16px;margin-bottom:8px}
+.details{font-size:14px;color:#666}
+.badge{background:#28a745;color:#fff;padding:4px 12px;border-radius:20px;font-size:12px;margin-left:10px}
+.two-col{display:grid;grid-template-columns:1fr 1fr;gap:20px}
+.success{color:#0f0}
+.error{color:#f00}
+.info{color:#0ff}
+</style>
+</head>
+<body>
+
+<h1>🏡 PropertyScout Analyzer</h1>
+
+<div class="box">
+  <div class="upload" onclick="document.getElementById('file').click()">
+    <h2>📁 Ladda GeoPackage (.gpkg)</h2>
+    <p>Dra och släpp din .gpkg-fil här, eller klicka</p>
+    <button type="button">Välj fil</button>
+    <input type="file" id="file" accept=".gpkg" onchange="handleFileSelect(this.files[0])">
+  </div>
+  
+  <div class="stats" id="stats" style="display:none"></div>
+  
+  <div class="two-col" id="main" style="display:none">
+    <div id="map"></div>
+    <div class="list" id="list"></div>
+  </div>
+  
+  <div class="log" id="log">&gt; Väntar på fil...</div>
+</div>
+
+<script>
+var SQL_READY = false;
+var MAP_INSTANCE = null;
+var LAYER_INSTANCE = null;
+var ALL_PROPERTIES = [];
+
+// Initialize SQL.js
+window.onload = function() {
+  writeLog('Laddar SQL.js...', 'info');
+  
+  initSqlJs({
+    locateFile: function(file) {
+      return 'https://cdn.jsdelivr.net/npm/sql.js@1.10.3/dist/' + file;
+    }
+  }).then(function(SQL) {
+    window.SQL = SQL;
+    SQL_READY = true;
+    writeLog('SQL.js redo!', 'success');
+  }).catch(function(err) {
+    writeLog('SQL.js fel: ' + err.message, 'error');
+  });
+  
+  // Drag and drop
+  var uploadZone = document.querySelector('.upload');
+  uploadZone.addEventListener('dragover', function(e) {
+    e.preventDefault();
+    uploadZone.style.borderColor = '#28a745';
+  });
+  uploadZone.addEventListener('dragleave', function() {
+    uploadZone.style.borderColor = '#667eea';
+  });
+  uploadZone.addEventListener('drop', function(e) {
+    e.preventDefault();
+    uploadZone.style.borderColor = '#667eea';
+    if (e.dataTransfer.files.length > 0) {
+      handleFileSelect(e.dataTransfer.files[0]);
+    }
+  });
+};
+
+function writeLog(message, type) {
+  var logDiv = document.getElementById('log');
+  var entry = document.createElement('div');
+  entry.className = type || 'info';
+  entry.textContent = '> ' + message;
+  logDiv.appendChild(entry);
+  logDiv.scrollTop = logDiv.scrollHeight;
+  console.log('[' + (type || 'INFO').toUpperCase() + ']', message);
+}
+
+async function handleFileSelect(file) {
+  if (!file) return;
+  if (!file.name.endsWith('.gpkg')) {
+    alert('Välj en .gpkg-fil!');
+    return;
+  }
+  if (!SQL_READY) {
+    alert('SQL.js inte redo än, vänta några sekunder');
+    return;
+  }
+  
+  writeLog('Läser ' + file.name, 'info');
+  
+  try {
+    var arrayBuffer = await file.arrayBuffer();
+    var uint8Array = new Uint8Array(arrayBuffer);
+    var database = new window.SQL.Database(uint8Array);
+    
+    writeLog('Parsar GeoPackage...', 'info');
+    
+    // List all tables
+    var tableQuery = database.exec("SELECT name FROM sqlite_master WHERE type='table'");
+    if (!tableQuery || !tableQuery[0]) {
+      throw new Error('Inga tabeller hittades');
+    }
+    
+    var allTables = tableQuery[0].values.map(function(row) { return row[0]; });
+    writeLog('Tabeller: ' + allTables.join(', '), 'info');
+    
+    // Find correct table (skip system tables and punkt tables)
+    var targetTable = null;
+    for (var i = 0; i < allTables.length; i++) {
+      var tableName = allTables[i];
+      var isSystem = tableName.startsWith('gpkg_') || 
+                     tableName.startsWith('sqlite_') || 
+                     tableName.startsWith('rtree_');
+      var isPunkt = tableName.toLowerCase().indexOf('punkt') !== -1;
+      
+      if (!isSystem && !isPunkt) {
+        targetTable = tableName;
+        break;
+      }
+    }
+    
+    // Fallback: use first non-system table
+    if (!targetTable) {
+      for (var i = 0; i < allTables.length; i++) {
+        var tableName = allTables[i];
+        if (!tableName.startsWith('gpkg_') && !tableName.startsWith('sqlite_')) {
+          targetTable = tableName;
+          break;
+        }
+      }
+    }
+    
+    if (!targetTable) {
+      throw new Error('Ingen användbar tabell hittades');
+    }
+    
+    writeLog('Använder tabell: ' + targetTable, 'info');
+    
+    // Query data
+    var dataQuery = database.exec('SELECT * FROM "' + targetTable + '" LIMIT 10000');
+    if (!dataQuery || !dataQuery[0]) {
+      throw new Error('Tom tabell');
+    }
+    
+    var columns = dataQuery[0].columns;
+    var rows = dataQuery[0].values;
+    
+    var geomIndex = -1;
+    var nameIndex = -1;
+    
+    for (var i = 0; i < columns.length; i++) {
+      var colName = columns[i].toLowerCase();
+      if (colName.indexOf('geom') !== -1) geomIndex = i;
+      if (colName.indexOf('beteckning') !== -1 || colName === 'namn' || colName === 'label') nameIndex = i;
+    }
+    
+    if (geomIndex === -1) {
+      throw new Error('Ingen geometri-kolumn hittades');
+    }
+    
+    writeLog('Parsar ' + rows.length + ' rader...', 'info');
+    
+    ALL_PROPERTIES = [];
+    
+    for (var i = 0; i < rows.length; i++) {
+      try {
+        var row = rows[i];
+        var geomBlob = row[geomIndex];
+        var propertyName = nameIndex >= 0 ? row[nameIndex] : 'Fastighet ' + (i + 1);
+        
+        var coordinates = parseWKBGeometry(geomBlob);
+        
+        if (coordinates && coordinates.length > 2) {
+          var areaM2 = calculatePolygonArea(coordinates);
+          
+          ALL_PROPERTIES.push({
+            name: propertyName,
+            area: areaM2,
+            coords: coordinates
+          });
+        }
+      } catch (err) {
+        // Skip invalid geometries
+      }
+    }
+    
+    writeLog('Hittade ' + ALL_PROPERTIES.length + ' fastigheter!', 'success');
+    
+    if (ALL_PROPERTIES.length > 0) {
+      initializeMap();
+      renderEverything();
+    } else {
+      writeLog('Inga giltiga geometrier hittades', 'error');
+    }
+    
+  } catch (error) {
+    writeLog('FEL: ' + error.message, 'error');
+    console.error(error);
+  }
+}
+
+function parseWKBGeometry(blob) {
+  if (!blob || blob.length < 50) return null;
+  
+  try {
+    var dataView = new DataView(blob.buffer ? blob.buffer : blob);
+    var coordinates = [];
+    var offset = 8; // Skip GeoPackage header
+    
+    var maxPoints = Math.min(Math.floor((blob.length - offset) / 16), 10000);
+    
+    for (var i = 0; i < maxPoints; i++) {
+      try {
+        var x = dataView.getFloat64(offset, true);
+        var y = dataView.getFloat64(offset + 8, true);
+        
+        var lat, lon;
+        
+        // SWEREF99 TM to WGS84 (approximation)
+        if (x > 100000 && y > 6000000) {
+          lat = (y - 6100000) / 111320 + 55;
+          lon = (x - 500000) / 111320 + 9;
+        } else if (x >= 10 && x <= 25 && y >= 55 && y <= 70) {
+          lat = y;
+          lon = x;
+        } else {
+          offset += 16;
+          continue;
+        }
+        
+        if (lat >= 55 && lat <= 70 && lon >= 10 && lon <= 25) {
+          coordinates.push([lat, lon]);
+        }
+        
+        offset += 16;
+      } catch (e) {
+        break;
+      }
+    }
+    
+    return coordinates.length > 2 ? coordinates : null;
+  } catch (error) {
+    return null;
+  }
+}
+
+function calculatePolygonArea(coords) {
+  var area = 0;
+  var j = coords.length - 1;
+  
+  for (var i = 0; i < coords.length; i++) {
+    area += (coords[j][1] + coords[i][1]) * (coords[j][0] - coords[i][0]);
+    j = i;
+  }
+  
+  return Math.abs(area * 111320 * 111320 / 2);
+}
+
+function initializeMap() {
+  if (!MAP_INSTANCE) {
+    writeLog('Initierar karta...', 'info');
+    MAP_INSTANCE = L.map('map').setView([59.33, 18.07], 10);
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+      maxZoom: 19
+    }).addTo(MAP_INSTANCE);
+    LAYER_INSTANCE = L.layerGroup().addTo(MAP_INSTANCE);
+  }
+  
+  document.getElementById('main').style.display = 'grid';
+  document.getElementById('stats').style.display = 'grid';
+}
+
+function renderEverything() {
+  ALL_PROPERTIES.sort(function(a, b) { return b.area - a.area; });
+  
+  var MIN_SIZE = 800;
+  var total = ALL_PROPERTIES.length;
+  var interesting = ALL_PROPERTIES.filter(function(p) { return p.area >= MIN_SIZE; }).length;
+  var highPotential = ALL_PROPERTIES.filter(function(p) { return p.area >= MIN_SIZE * 2; }).length;
+  var avgArea = Math.round(ALL_PROPERTIES.reduce(function(sum, p) { return sum + p.area; }, 0) / total);
+  
+  // Stats
+  var statsHTML = '';
+  statsHTML += '<div class="stat"><div class="num">' + total + '</div><div class="label">Totalt</div></div>';
+  statsHTML += '<div class="stat"><div class="num">' + interesting + '</div><div class="label">Intressanta (≥800m²)</div></div>';
+  statsHTML += '<div class="stat"><div class="num">' + highPotential + '</div><div class="label">Hög potential (≥1600m²)</div></div>';
+  statsHTML += '<div class="stat"><div class="num">' + avgArea.toLocaleString('sv-SE') + '</div><div class="label">Medel (m²)</div></div>';
+  document.getElementById('stats').innerHTML = statsHTML;
+  
+  // Map
+  LAYER_INSTANCE.clearLayers();
+  var bounds = [];
+  
+  for (var i = 0; i < ALL_PROPERTIES.length; i++) {
+    var prop = ALL_PROPERTIES[i];
+    var isHighPot = prop.area >= MIN_SIZE * 2;
+    var isInteresting = prop.area >= MIN_SIZE;
+    var color = isHighPot ? '#28a745' : isInteresting ? '#ffc107' : '#667eea';
+    
+    var polygon = L.polygon(prop.coords, {
+      color: color,
+      weight: isInteresting ? 2 : 1,
+      fillColor: color,
+      fillOpacity: isInteresting ? 0.3 : 0.15
+    }).addTo(LAYER_INSTANCE);
+    
+    polygon.bindPopup('<b>' + prop.name + '</b><br>' + Math.round(prop.area).toLocaleString('sv-SE') + ' m²');
+    
+    for (var j = 0; j < prop.coords.length; j++) {
+      bounds.push(prop.coords[j]);
+    }
+  }
+  
+  if (bounds.length > 0) {
+    MAP_INSTANCE.fitBounds(bounds, { padding: [30, 30] });
+  }
+  
+  // List
+  var listHTML = '<h3>📋 Fastigheter (' + total + ')</h3>';
+  
+  for (var i = 0; i < ALL_PROPERTIES.length; i++) {
+    var prop = ALL_PROPERTIES[i];
+    var isHighPot = prop.area >= MIN_SIZE * 2;
+    var isInteresting = prop.area >= MIN_SIZE;
+    
+    listHTML += '<div class="item ' + (isHighPot ? 'hot' : '') + '" onclick="zoomToProperty(' + i + ')">';
+    listHTML += '<div class="name">' + prop.name;
+    if (isHighPot) listHTML += '<span class="badge">🎯 HÖG POTENTIAL</span>';
+    listHTML += '</div>';
+    listHTML += '<div class="details">📐 ' + Math.round(prop.area).toLocaleString('sv-SE') + ' m²';
+    if (isInteresting) {
+      var factor = Math.floor(prop.area / MIN_SIZE);
+      listHTML += ' | ✂️ Kan delas i ~' + factor + ' tomter';
+    }
+    listHTML += '</div></div>';
+  }
+  
+  document.getElementById('list').innerHTML = listHTML;
+  
+  writeLog('Klar! Visade ' + total + ' fastigheter', 'success');
+}
+
+function zoomToProperty(index) {
+  var prop = ALL_PROPERTIES[index];
+  MAP_INSTANCE.fitBounds(prop.coords, { padding: [50, 50] });
+}
+</script>
+
+</body>
+</html>
